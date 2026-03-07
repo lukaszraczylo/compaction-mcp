@@ -6,11 +6,23 @@ Designed to complement long-term memory tools (like claude-mnemonic) by handling
 
 ## Install
 
+### Binary
+
+Download from [releases](https://github.com/lukaszraczylo/compaction-mcp/releases) or build from source:
+
 ```sh
 go build -o compactor .
 ```
 
 Single binary, no external dependencies. ~6 MiB.
+
+### Docker
+
+```sh
+docker pull ghcr.io/lukaszraczylo/compaction-mcp:latest
+```
+
+Multi-platform image (linux/amd64, linux/arm64) built on distroless.
 
 ## Usage
 
@@ -25,15 +37,42 @@ compactor --state-dir ~/.local/share/compactor
 compactor --budget 80000
 ```
 
+### Docker
+
+The container runs the compactor binary as its entrypoint. Since the MCP server communicates over stdio, run with `-i` (interactive):
+
+```sh
+# Ephemeral
+docker run -i ghcr.io/lukaszraczylo/compaction-mcp:latest
+
+# With persistent state
+docker run -i -v compactor-data:/data ghcr.io/lukaszraczylo/compaction-mcp:latest --state-dir /data
+
+# With explicit budget
+docker run -i ghcr.io/lukaszraczylo/compaction-mcp:latest --budget 80000
+```
+
 ### Claude Code
 
-`.claude/settings.json`:
+`.claude/settings.json` (binary):
 ```json
 {
   "mcpServers": {
     "compactor": {
       "command": "/path/to/compactor",
       "args": ["--state-dir", "/tmp/compactor-state"]
+    }
+  }
+}
+```
+
+`.claude/settings.json` (Docker):
+```json
+{
+  "mcpServers": {
+    "compactor": {
+      "command": "docker",
+      "args": ["run", "-i", "--rm", "-v", "compactor-data:/data", "ghcr.io/lukaszraczylo/compaction-mcp:latest", "--state-dir", "/data"]
     }
   }
 }
