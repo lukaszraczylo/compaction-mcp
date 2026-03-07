@@ -1,0 +1,24 @@
+version: 1
+force:
+  major: 0
+  minor: 1
+  patch: 0
+blacklist:
+  - "Merge branch"
+  - "Merge pull request"
+wording:
+  patch:
+    - update
+    - fix
+    - bugfix
+    - patch
+    - tweak
+  minor:
+    - change
+    - improve
+    - add
+    - feature
+    - enhance
+  major:
+    - breaking
+    - major

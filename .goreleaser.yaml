@@ -1,0 +1,76 @@
+version: 2
+
+builds:
+  - binary: compactor
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+
+archives:
+  - format: tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+
+dockers:
+  - image_templates:
+      - "ghcr.io/lukaszraczylo/compaction-mcp:{{ .Tag }}-amd64"
+      - "ghcr.io/lukaszraczylo/compaction-mcp:latest-amd64"
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/amd64"
+    goarch: amd64
+    dockerfile: Dockerfile
+
+  - image_templates:
+      - "ghcr.io/lukaszraczylo/compaction-mcp:{{ .Tag }}-arm64"
+      - "ghcr.io/lukaszraczylo/compaction-mcp:latest-arm64"
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/arm64"
+    goarch: arm64
+    dockerfile: Dockerfile
+
+docker_manifests:
+  - name_template: "ghcr.io/lukaszraczylo/compaction-mcp:{{ .Tag }}"
+    image_templates:
+      - "ghcr.io/lukaszraczylo/compaction-mcp:{{ .Tag }}-amd64"
+      - "ghcr.io/lukaszraczylo/compaction-mcp:{{ .Tag }}-arm64"
+
+  - name_template: "ghcr.io/lukaszraczylo/compaction-mcp:latest"
+    image_templates:
+      - "ghcr.io/lukaszraczylo/compaction-mcp:latest-amd64"
+      - "ghcr.io/lukaszraczylo/compaction-mcp:latest-arm64"
+
+checksum:
+  name_template: "checksums.txt"
+
+signs:
+  - cmd: cosign
+    artifacts: checksum
+    output: true
+    args:
+      - "sign-blob"
+      - "--yes"
+      - "${artifact}"
+      - "--output-certificate"
+      - "${signature}.pem"
+      - "--bundle"
+      - "${signature}.sigstore.json"
+
+docker_signs:
+  - cmd: cosign
+    artifacts: manifests
+    output: true
+    args:
+      - "sign"
+      - "--yes"
+      - "${artifact}"
+
+changelog:
+  disable: true

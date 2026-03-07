@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -10,6 +11,13 @@ import (
 )
 
 func registerTools(s *server.MCPServer, store *Store) {
+	s.AddTool(mcp.NewTool("recall",
+		mcp.WithDescription("Restore working context from previous sessions. Call this FIRST at the start of every session. Returns budget status and the most important stored items. Use this before re-reading files or asking the user to repeat information."),
+		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithNumber("limit", mcp.Description("Max items to return (default 20)")),
+	), handleRecall(store))
+
 	s.AddTool(mcp.NewTool("store",
 		mcp.WithDescription("Store a context item for later retrieval. Offload information from working context. Provide a summary for efficient compaction when budget is tight."),
 		mcp.WithString("content", mcp.Required(), mcp.Description("The content to store")),
@@ -46,6 +54,13 @@ func registerTools(s *server.MCPServer, store *Store) {
 		mcp.WithString("id", mcp.Required(), mcp.Description("Item ID to pin")),
 	), handlePin(store))
 
+	s.AddTool(mcp.NewTool("unpin",
+		mcp.WithDescription("Unpin a context item to allow automatic eviction during compaction."),
+		mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithIdempotentHintAnnotation(true),
+		mcp.WithString("id", mcp.Required(), mcp.Description("Item ID to unpin")),
+	), handleUnpin(store))
+
 	s.AddTool(mcp.NewTool("forget",
 		mcp.WithDescription("Remove a context item from storage."),
 		mcp.WithDestructiveHintAnnotation(true),
@@ -68,6 +83,75 @@ func registerTools(s *server.MCPServer, store *Store) {
 		mcp.WithString("id", mcp.Required(), mcp.Description("Item ID to update")),
 		mcp.WithString("summary", mcp.Required(), mcp.Description("New summary for the item")),
 	), handleUpdate(store))
+
+	s.AddTool(mcp.NewTool("list",
+		mcp.WithDescription("List stored context items with pagination. Returns items sorted by creation time (newest first)."),
+		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithNumber("offset", mcp.Description("Number of items to skip (default 0)")),
+		mcp.WithNumber("limit", mcp.Description("Max items to return (default 20)")),
+	), handleList(store))
+
+	s.AddTool(mcp.NewTool("bulk_store",
+		mcp.WithDescription("Store multiple context items at once. Accepts a JSON array of items."),
+		mcp.WithString("items", mcp.Required(), mcp.Description("JSON array of items: [{\"content\":\"...\",\"summary\":\"...\",\"tags\":[\"...\"],\"importance\":5}]")),
+	), handleBulkStore(store))
+
+	s.AddTool(mcp.NewTool("export",
+		mcp.WithDescription("Export all stored context items. Optionally return summaries instead of full content where available."),
+		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithBoolean("summaries_only", mcp.Description("If true, return summaries instead of full content where available")),
+	), handleExport(store))
+}
+
+func handleRecall(store *Store) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		limit := req.GetInt("limit", 20)
+
+		budget, used, count, usage, items := store.Recall(limit)
+
+		var sb strings.Builder
+		fmt.Fprintf(&sb, "Budget: %d/%d tokens (%.1f%%), %d items stored\n", used, budget, usage*100, count)
+
+		if count == 0 {
+			sb.WriteString("\nNo stored context. Start using 'store' to offload information.")
+			return mcp.NewToolResultText(sb.String()), nil
+		}
+
+		tight := store.BudgetTight()
+		fmt.Fprintf(&sb, "\nTop %d items by relevance", len(items))
+		if tight {
+			sb.WriteString(" (budget tight, showing summaries where available)")
+		}
+		sb.WriteString(":\n\n")
+
+		for _, item := range items {
+			fmt.Fprintf(&sb, "[%s] importance:%d tokens:%d", item.ID, item.Importance, item.Tokens)
+			if item.Pinned {
+				sb.WriteString(" PINNED")
+			}
+			sb.WriteString("\n")
+			if len(item.Tags) > 0 {
+				fmt.Fprintf(&sb, "Tags: %s\n", strings.Join(item.Tags, ", "))
+			}
+			sb.WriteString("---\n")
+			if tight && item.Summary != "" {
+				sb.WriteString(item.Summary)
+			} else if item.Summary != "" {
+				sb.WriteString(item.Summary)
+			} else {
+				preview := item.Content
+				if len(preview) > 200 {
+					preview = preview[:200] + "..."
+				}
+				sb.WriteString(preview)
+			}
+			sb.WriteString("\n\n")
+		}
+
+		return mcp.NewToolResultText(sb.String()), nil
+	}
 }
 
 func handleStore(store *Store) server.ToolHandlerFunc {
@@ -90,7 +174,10 @@ func handleStore(store *Store) server.ToolHandlerFunc {
 			}
 		}
 
-		item := store.Add(content, summary, tags, importance)
+		item, addErr := store.Add(content, summary, tags, importance)
+		if addErr != nil {
+			return mcp.NewToolResultError(addErr.Error()), nil
+		}
 		budget, used, count, usage := store.Status()
 
 		return mcp.NewToolResultText(fmt.Sprintf(
@@ -164,7 +251,7 @@ func handleStatus(store *Store) server.ToolHandlerFunc {
 func handleCompact(store *Store) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		target := req.GetFloat("target_usage", 0.7)
-		if target <= 0 || target > 1.0 {
+		if target < 0 || target > 1.0 {
 			target = 0.7
 		}
 
@@ -176,16 +263,16 @@ func handleCompact(store *Store) server.ToolHandlerFunc {
 		fmt.Fprintf(&sb, "- Summary promoted: %d items\n", result.Summarized)
 		fmt.Fprintf(&sb, "- Deduplicated: %d pairs\n", result.Deduplicated)
 		fmt.Fprintf(&sb, "- Tokens freed: %d\n", result.TokensFreed)
-		fmt.Fprintf(&sb, "- Budget: %d → %d tokens\n", result.TokensBefore, result.TokensAfter)
+		fmt.Fprintf(&sb, "- Budget: %d -> %d tokens\n", result.TokensBefore, result.TokensAfter)
 
 		if len(result.NeedsSummary) > 0 {
 			sb.WriteString("\nItems that would benefit from summarization:\n")
-			for _, item := range result.NeedsSummary {
-				preview := item.Content
+			for _, sc := range result.NeedsSummary {
+				preview := sc.Preview
 				if len(preview) > 80 {
-					preview = preview[:80] + "..."
+					preview = preview[:80]
 				}
-				fmt.Fprintf(&sb, "- [%s] %d tokens: %q\n", item.ID, item.Tokens, preview)
+				fmt.Fprintf(&sb, "- [%s] %d tokens: %q\n", sc.ID, sc.Tokens, preview)
 			}
 			sb.WriteString("\nUse 'update' tool to add summaries to these items.")
 		}
@@ -202,6 +289,19 @@ func handlePin(store *Store) server.ToolHandlerFunc {
 		}
 		if store.Pin(id) {
 			return mcp.NewToolResultText(fmt.Sprintf("Pinned [%s]", id)), nil
+		}
+		return mcp.NewToolResultError(fmt.Sprintf("Item [%s] not found", id)), nil
+	}
+}
+
+func handleUnpin(store *Store) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		id, err := req.RequireString("id")
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		if store.Unpin(id) {
+			return mcp.NewToolResultText(fmt.Sprintf("Unpinned [%s]", id)), nil
 		}
 		return mcp.NewToolResultError(fmt.Sprintf("Item [%s] not found", id)), nil
 	}
@@ -263,5 +363,107 @@ func handleUpdate(store *Store) server.ToolHandlerFunc {
 			return mcp.NewToolResultText(fmt.Sprintf("Updated summary for [%s]", id)), nil
 		}
 		return mcp.NewToolResultError(fmt.Sprintf("Item [%s] not found", id)), nil
+	}
+}
+
+func handleList(store *Store) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		offset := req.GetInt("offset", 0)
+		limit := req.GetInt("limit", 20)
+
+		items, total := store.ListItems(offset, limit)
+		if len(items) == 0 {
+			return mcp.NewToolResultText(fmt.Sprintf("No items (total: %d).", total)), nil
+		}
+
+		var sb strings.Builder
+		fmt.Fprintf(&sb, "Items %d-%d of %d:\n\n", offset+1, offset+len(items), total)
+		for _, item := range items {
+			fmt.Fprintf(&sb, "[%s] importance:%d tokens:%d", item.ID, item.Importance, item.Tokens)
+			if item.Pinned {
+				sb.WriteString(" PINNED")
+			}
+			sb.WriteString("\n")
+			if len(item.Tags) > 0 {
+				fmt.Fprintf(&sb, "Tags: %s\n", strings.Join(item.Tags, ", "))
+			}
+			preview := item.Content
+			if len(preview) > 80 {
+				preview = preview[:80] + "..."
+			}
+			fmt.Fprintf(&sb, "%s\n\n", preview)
+		}
+		return mcp.NewToolResultText(sb.String()), nil
+	}
+}
+
+func handleBulkStore(store *Store) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		itemsJSON, err := req.RequireString("items")
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+
+		var bulkItems []BulkItem
+		if err := json.Unmarshal([]byte(itemsJSON), &bulkItems); err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Invalid JSON: %v", err)), nil
+		}
+		if len(bulkItems) == 0 {
+			return mcp.NewToolResultError("No items provided"), nil
+		}
+
+		results, errs := store.BulkAdd(bulkItems)
+
+		var sb strings.Builder
+		stored := 0
+		failed := 0
+		for i, item := range results {
+			if errs[i] != nil {
+				failed++
+				fmt.Fprintf(&sb, "FAILED item %d: %v\n", i+1, errs[i])
+			} else {
+				stored++
+				fmt.Fprintf(&sb, "Stored [%s] (%d tokens)\n", item.ID, item.Tokens)
+			}
+		}
+
+		budget, used, count, usage := store.Status()
+		fmt.Fprintf(&sb, "\nStored: %d, Failed: %d\nBudget: %d/%d tokens (%.0f%%), %d items",
+			stored, failed, used, budget, usage*100, count)
+
+		return mcp.NewToolResultText(sb.String()), nil
+	}
+}
+
+func handleExport(store *Store) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		summariesOnly := req.GetBool("summaries_only", false)
+
+		items := store.Export(summariesOnly)
+		if len(items) == 0 {
+			return mcp.NewToolResultText("No items to export."), nil
+		}
+
+		var sb strings.Builder
+		fmt.Fprintf(&sb, "Exported %d items", len(items))
+		if summariesOnly {
+			sb.WriteString(" (summaries where available)")
+		}
+		sb.WriteString(":\n\n")
+
+		for _, item := range items {
+			fmt.Fprintf(&sb, "[%s] importance:%d tokens:%d", item.ID, item.Importance, item.Tokens)
+			if item.Pinned {
+				sb.WriteString(" PINNED")
+			}
+			sb.WriteString("\n")
+			if len(item.Tags) > 0 {
+				fmt.Fprintf(&sb, "Tags: %s\n", strings.Join(item.Tags, ", "))
+			}
+			sb.WriteString("---\n")
+			sb.WriteString(item.Content)
+			sb.WriteString("\n\n")
+		}
+		return mcp.NewToolResultText(sb.String()), nil
 	}
 }

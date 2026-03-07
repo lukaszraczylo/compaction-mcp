@@ -2,12 +2,19 @@ package main
 
 import (
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+)
+
+const (
+	maxItems           = 10000
+	maxContentBytes    = 1 << 20 // 1 MiB
+	maxDedupCandidates = 500
 )
 
 type Item struct {
@@ -20,11 +27,18 @@ type Item struct {
 	Tokens      int
 	AccessCount int
 	Importance  int
+	ContentType ContentType
 	Pinned      bool
 }
 
+type SummaryCandidate struct {
+	ID      string
+	Preview string
+	Tokens  int
+}
+
 type CompactResult struct {
-	NeedsSummary []*Item
+	NeedsSummary []SummaryCandidate
 	TokensFreed  int
 	TokensBefore int
 	TokensAfter  int
@@ -33,8 +47,16 @@ type CompactResult struct {
 	Deduplicated int
 }
 
+type BulkItem struct {
+	Content    string
+	Summary    string
+	Tags       []string
+	Importance int
+}
+
 type Store struct {
 	items                map[string]*Item
+	index                *Index
 	tokenBudget          int
 	usedTokens           int
 	autoCompactThreshold float64
@@ -45,15 +67,23 @@ type Store struct {
 func NewStore(tokenBudget int) *Store {
 	return &Store{
 		items:                make(map[string]*Item),
+		index:                NewIndex(),
 		tokenBudget:          tokenBudget,
 		autoCompact:          true,
 		autoCompactThreshold: 0.9,
 	}
 }
 
-func (s *Store) Add(content, summary string, tags []string, importance int) *Item {
+func (s *Store) Add(content, summary string, tags []string, importance int) (*Item, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if len(s.items) >= maxItems {
+		return nil, errors.New("item limit reached (max 10000)")
+	}
+	if len(content) > maxContentBytes {
+		return nil, fmt.Errorf("content too large (%d bytes, max %d)", len(content), maxContentBytes)
+	}
 
 	if importance < 1 {
 		importance = 5
@@ -61,31 +91,38 @@ func (s *Store) Add(content, summary string, tags []string, importance int) *Ite
 		importance = 10
 	}
 
+	ct := DetectContentType(content)
+	if len(tags) == 0 {
+		tags = AutoTags(content)
+	}
+
 	tokens := EstimateTokens(content)
 	item := &Item{
-		ID:         newID(),
-		Content:    content,
-		Summary:    summary,
-		Tags:       tags,
-		Importance: importance,
-		CreatedAt:  time.Now(),
-		AccessedAt: time.Now(),
-		Tokens:     tokens,
+		ID:          newID(),
+		Content:     content,
+		Summary:     summary,
+		Tags:        tags,
+		Importance:  importance,
+		ContentType: ct,
+		CreatedAt:   time.Now(),
+		AccessedAt:  time.Now(),
+		Tokens:      tokens,
 	}
 
 	s.items[item.ID] = item
 	s.usedTokens += tokens
+	s.index.Add(item.ID, content, tags)
 
 	if s.autoCompact && s.tokenBudget > 0 {
 		if float64(s.usedTokens)/float64(s.tokenBudget) > s.autoCompactThreshold {
-			s.compactLocked(0.8)
+			s.compactLocked(0.8, false)
 		}
 	}
 
-	return item
+	return item, nil
 }
 
-func (s *Store) Get(id string) (*Item, bool) {
+func (s *Store) Get(id string) (Item, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -93,8 +130,9 @@ func (s *Store) Get(id string) (*Item, bool) {
 	if ok {
 		item.AccessedAt = time.Now()
 		item.AccessCount++
+		return *item, true
 	}
-	return item, ok
+	return Item{}, false
 }
 
 func (s *Store) Remove(id string) bool {
@@ -106,6 +144,7 @@ func (s *Store) Remove(id string) bool {
 		return false
 	}
 	s.usedTokens -= item.Tokens
+	s.index.Remove(id)
 	delete(s.items, id)
 	return true
 }
@@ -121,6 +160,17 @@ func (s *Store) Pin(id string) bool {
 	return ok
 }
 
+func (s *Store) Unpin(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	item, ok := s.items[id]
+	if ok {
+		item.Pinned = false
+	}
+	return ok
+}
+
 func (s *Store) UpdateSummary(id, summary string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -132,7 +182,7 @@ func (s *Store) UpdateSummary(id, summary string) bool {
 	return ok
 }
 
-func (s *Store) Query(query string, tags []string, limit int) []*Item {
+func (s *Store) Query(query string, tags []string, limit int) []Item {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -140,26 +190,160 @@ func (s *Store) Query(query string, tags []string, limit int) []*Item {
 		limit = 10
 	}
 
-	queryWords := wordSet(query)
-	var results []*Item
+	type scored struct {
+		item  *Item
+		score float64
+	}
+	var results []scored
 
-	for _, item := range s.items {
-		if len(tags) > 0 && !hasAnyTag(item, tags) {
-			continue
+	if query != "" {
+		// BM25 search ranks results by relevance
+		searchResults := s.index.Search(query, 0)
+		for _, sr := range searchResults {
+			item, ok := s.items[sr.ID]
+			if !ok {
+				continue
+			}
+			if len(tags) > 0 && !hasAnyTag(item, tags) {
+				continue
+			}
+			// Combine BM25 relevance with item score
+			results = append(results, scored{item: item, score: sr.Score + s.scoreLocked(item)})
 		}
-		item.AccessedAt = time.Now()
-		item.AccessCount++
-		results = append(results, item)
+	} else {
+		// No query text — filter by tags, sort by score
+		for _, item := range s.items {
+			if len(tags) > 0 && !hasAnyTag(item, tags) {
+				continue
+			}
+			results = append(results, scored{item: item, score: s.scoreLocked(item)})
+		}
 	}
 
 	sort.Slice(results, func(i, j int) bool {
-		return s.queryScore(results[i], queryWords) > s.queryScore(results[j], queryWords)
+		return results[i].score > results[j].score
 	})
 
 	if len(results) > limit {
 		results = results[:limit]
 	}
-	return results
+
+	// Only bump AccessedAt/AccessCount on items that made the cut
+	out := make([]Item, len(results))
+	for i, r := range results {
+		r.item.AccessedAt = time.Now()
+		r.item.AccessCount++
+		out[i] = *r.item
+	}
+	return out
+}
+
+func (s *Store) ListItems(offset, limit int) ([]Item, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	total := len(s.items)
+
+	// Collect and sort by creation time descending
+	all := make([]*Item, 0, total)
+	for _, item := range s.items {
+		all = append(all, item)
+	}
+	sort.Slice(all, func(i, j int) bool {
+		return all[i].CreatedAt.After(all[j].CreatedAt)
+	})
+
+	if offset < 0 {
+		offset = 0
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+
+	if offset >= len(all) {
+		return nil, total
+	}
+	end := offset + limit
+	if end > len(all) {
+		end = len(all)
+	}
+
+	out := make([]Item, end-offset)
+	for i, item := range all[offset:end] {
+		out[i] = *item
+	}
+	return out, total
+}
+
+func (s *Store) BulkAdd(items []BulkItem) ([]*Item, []error) {
+	results := make([]*Item, len(items))
+	errs := make([]error, len(items))
+	for i, bi := range items {
+		item, err := s.Add(bi.Content, bi.Summary, bi.Tags, bi.Importance)
+		results[i] = item
+		errs[i] = err
+	}
+	return results, errs
+}
+
+func (s *Store) Export(summariesOnly bool) []Item {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	out := make([]Item, 0, len(s.items))
+	for _, item := range s.items {
+		cp := *item
+		if summariesOnly && cp.Summary != "" {
+			cp.Content = cp.Summary
+			cp.Tokens = EstimateTokens(cp.Content)
+		}
+		out = append(out, cp)
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
+	return out
+}
+
+// Recall returns status info and the top items by retention score.
+// Designed as a single "session start" call to restore working context.
+func (s *Store) Recall(limit int) (budget, used, count int, usage float64, items []Item) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	budget = s.tokenBudget
+	used = s.usedTokens
+	count = len(s.items)
+	if budget > 0 {
+		usage = float64(used) / float64(budget)
+	}
+
+	if count == 0 || limit <= 0 {
+		return
+	}
+
+	type scored struct {
+		item  *Item
+		score float64
+	}
+	all := make([]scored, 0, count)
+	for _, item := range s.items {
+		all = append(all, scored{item: item, score: s.scoreLocked(item)})
+	}
+	sort.Slice(all, func(i, j int) bool {
+		return all[i].score > all[j].score
+	})
+
+	n := limit
+	if n > len(all) {
+		n = len(all)
+	}
+	items = make([]Item, n)
+	for i := 0; i < n; i++ {
+		items[i] = *all[i].item
+	}
+	return
 }
 
 func (s *Store) scoreLocked(item *Item) float64 {
@@ -167,11 +351,13 @@ func (s *Store) scoreLocked(item *Item) float64 {
 		return math.MaxFloat64
 	}
 
+	halfLife := DecayHalfLifeMinutes(item.ContentType)
 	age := time.Since(item.AccessedAt).Minutes()
-	recency := math.Exp(-age / 120.0) // half-life ~2 hours
+	recency := math.Exp(-age / halfLife)
 
 	importance := float64(item.Importance) / 10.0
-	access := math.Log1p(float64(item.AccessCount)) / 5.0
+	importance *= ScoreMultiplier(item.ContentType)
+	access := math.Min(math.Log1p(float64(item.AccessCount))/5.0, 1.0)
 
 	var sizePenalty float64
 	if s.tokenBudget > 0 {
@@ -179,25 +365,6 @@ func (s *Store) scoreLocked(item *Item) float64 {
 	}
 
 	return (0.4 * importance) + (0.3 * recency) + (0.2 * access) - (0.1 * sizePenalty)
-}
-
-func (s *Store) queryScore(item *Item, queryWords map[string]struct{}) float64 {
-	base := s.scoreLocked(item)
-	if len(queryWords) == 0 {
-		return base
-	}
-
-	contentWords := wordSet(item.Content)
-	if item.Summary != "" {
-		for w := range wordSet(item.Summary) {
-			contentWords[w] = struct{}{}
-		}
-	}
-	for _, tag := range item.Tags {
-		contentWords[strings.ToLower(tag)] = struct{}{}
-	}
-
-	return base + (0.5 * jaccardSimilarity(queryWords, contentWords))
 }
 
 func (s *Store) Status() (budget, used, count int, usage float64) {
@@ -253,10 +420,10 @@ func (s *Store) AutoCompactThreshold() float64 {
 func (s *Store) Compact(targetUsage float64) CompactResult {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.compactLocked(targetUsage)
+	return s.compactLocked(targetUsage, true)
 }
 
-func (s *Store) compactLocked(targetUsage float64) CompactResult {
+func (s *Store) compactLocked(targetUsage float64, fullCompaction bool) CompactResult {
 	result := CompactResult{TokensBefore: s.usedTokens}
 
 	if s.tokenBudget <= 0 {
@@ -271,13 +438,27 @@ func (s *Store) compactLocked(targetUsage float64) CompactResult {
 	}
 
 	// Phase 1: Summary promotion — replace content with summary to save tokens
+	// Sort candidates by score ascending so we promote lowest-scoring items first
+	type promoCandidate struct {
+		item  *Item
+		score float64
+	}
+	var promoCandidates []promoCandidate
 	for _, item := range s.items {
-		if s.usedTokens <= targetTokens {
-			break
-		}
 		if item.Pinned || item.Summary == "" || item.Content == item.Summary {
 			continue
 		}
+		promoCandidates = append(promoCandidates, promoCandidate{item: item, score: s.scoreLocked(item)})
+	}
+	sort.Slice(promoCandidates, func(i, j int) bool {
+		return promoCandidates[i].score < promoCandidates[j].score
+	})
+
+	for _, pc := range promoCandidates {
+		if s.usedTokens <= targetTokens {
+			break
+		}
+		item := pc.item
 		oldTokens := item.Tokens
 		item.Content = item.Summary
 		item.Tokens = EstimateTokens(item.Content)
@@ -286,58 +467,74 @@ func (s *Store) compactLocked(targetUsage float64) CompactResult {
 			s.usedTokens -= saved
 			result.Summarized++
 			result.TokensFreed += saved
+			s.index.Add(item.ID, item.Content, item.Tags)
 		}
 	}
 
-	// Phase 2: Deduplication — merge items with >70% word overlap
-	ids := make([]string, 0, len(s.items))
-	for id := range s.items {
-		ids = append(ids, id)
-	}
-	merged := make(map[string]bool)
-
-	for i := 0; i < len(ids); i++ {
-		if merged[ids[i]] {
-			continue
+	// Phase 2: Deduplication — merge items with >70% word overlap (full compaction only)
+	if fullCompaction {
+		ids := make([]string, 0, len(s.items))
+		for id := range s.items {
+			ids = append(ids, id)
 		}
-		a := s.items[ids[i]]
-		if a == nil || a.Pinned {
-			continue
-		}
-		aWords := wordSet(a.Content)
 
-		for j := i + 1; j < len(ids); j++ {
-			if merged[ids[j]] {
+		// Cap dedup candidates
+		if len(ids) > maxDedupCandidates {
+			// Sort by score ascending to prioritize merging low-value items
+			sort.Slice(ids, func(i, j int) bool {
+				return s.scoreLocked(s.items[ids[i]]) < s.scoreLocked(s.items[ids[j]])
+			})
+			ids = ids[:maxDedupCandidates]
+		}
+
+		merged := make(map[string]bool)
+
+		for i := 0; i < len(ids); i++ {
+			if merged[ids[i]] {
 				continue
 			}
-			b := s.items[ids[j]]
-			if b == nil {
+			a := s.items[ids[i]]
+			if a == nil || a.Pinned {
 				continue
 			}
+			aWords := wordSet(a.Content)
 
-			if jaccardSimilarity(aWords, wordSet(b.Content)) > 0.7 {
-				// Keep higher-scoring item, merge tags
-				if s.scoreLocked(a) >= s.scoreLocked(b) {
-					a.Tags = mergeTags(a.Tags, b.Tags)
-					if a.Summary == "" && b.Summary != "" {
-						a.Summary = b.Summary
-					}
-					s.usedTokens -= b.Tokens
-					result.TokensFreed += b.Tokens
-					delete(s.items, ids[j])
-					merged[ids[j]] = true
-				} else {
-					b.Tags = mergeTags(b.Tags, a.Tags)
-					if b.Summary == "" && a.Summary != "" {
-						b.Summary = a.Summary
-					}
-					s.usedTokens -= a.Tokens
-					result.TokensFreed += a.Tokens
-					delete(s.items, ids[i])
-					merged[ids[i]] = true
-					break
+			for j := i + 1; j < len(ids); j++ {
+				if merged[ids[j]] {
+					continue
 				}
-				result.Deduplicated++
+				b := s.items[ids[j]]
+				if b == nil {
+					continue
+				}
+
+				if jaccardSimilarity(aWords, wordSet(b.Content)) > 0.7 {
+					// Keep higher-scoring item, merge tags
+					if s.scoreLocked(a) >= s.scoreLocked(b) {
+						a.Tags = mergeTags(a.Tags, b.Tags)
+						if a.Summary == "" && b.Summary != "" {
+							a.Summary = b.Summary
+						}
+						s.usedTokens -= b.Tokens
+						result.TokensFreed += b.Tokens
+						s.index.Remove(ids[j])
+						delete(s.items, ids[j])
+						merged[ids[j]] = true
+					} else {
+						b.Tags = mergeTags(b.Tags, a.Tags)
+						if b.Summary == "" && a.Summary != "" {
+							b.Summary = a.Summary
+						}
+						s.usedTokens -= a.Tokens
+						result.TokensFreed += a.Tokens
+						s.index.Remove(ids[i])
+						delete(s.items, ids[i])
+						merged[ids[i]] = true
+						result.Deduplicated++
+						break
+					}
+					result.Deduplicated++
+				}
 			}
 		}
 	}
@@ -360,6 +557,7 @@ func (s *Store) compactLocked(targetUsage float64) CompactResult {
 			}
 			s.usedTokens -= item.Tokens
 			result.TokensFreed += item.Tokens
+			s.index.Remove(item.ID)
 			delete(s.items, item.ID)
 			result.Evicted++
 		}
@@ -368,7 +566,15 @@ func (s *Store) compactLocked(targetUsage float64) CompactResult {
 	// Collect items that could benefit from LLM summarization
 	for _, item := range s.items {
 		if item.Summary == "" && item.Tokens > 100 {
-			result.NeedsSummary = append(result.NeedsSummary, item)
+			preview := item.Content
+			if len(preview) > 80 {
+				preview = preview[:80]
+			}
+			result.NeedsSummary = append(result.NeedsSummary, SummaryCandidate{
+				ID:      item.ID,
+				Tokens:  item.Tokens,
+				Preview: preview,
+			})
 		}
 	}
 
