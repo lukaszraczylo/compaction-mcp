@@ -57,11 +57,10 @@ signs:
     args:
       - "sign-blob"
       - "--yes"
-      - "${artifact}"
-      - "--output-certificate"
-      - "${signature}.pem"
       - "--bundle"
-      - "${signature}.sigstore.json"
+      - "${signature}"
+      - "${artifact}"
+    signature: "checksums.txt.sigstore.json"
 
 docker_signs:
   - cmd: cosign
