@@ -2,7 +2,7 @@ module compaction-mcp
 
 go 1.26.1
 
-require github.com/mark3labs/mcp-go v1.3.0
+require github.com/mark3labs/mcp-go v1.4.0
 
 require (
 	github.com/google/jsonschema-go v0.4.3 // indirect
